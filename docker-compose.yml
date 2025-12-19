@@ -1,0 +1,41 @@
+services:
+  mongo_db:
+    image: mongo:7.0
+    container_name: chatify_mongo
+    restart: always
+    ports:
+      - '27017:27017'
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: 123456
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - chatify_network
+
+  api:
+    build:
+      context: .
+      target: development
+    container_name: chatify_api
+    command: npm run start:dev
+    ports:
+      - '3000:3000'
+    environment:
+      MONGO_URI: mongodb://root:123456@mongo_db:27017/chatify_db?authSource=admin
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    depends_on:
+      - mongo_db
+    networks:
+      - chatify_network
+    profiles: ['app']
+
+volumes:
+  mongo_data:
+    driver: local
+
+networks:
+  chatify_network:
+    driver: bridge
