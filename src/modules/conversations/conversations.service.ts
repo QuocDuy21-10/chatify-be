@@ -57,7 +57,7 @@ export class ConversationsService {
       .populate('participants', 'name email avatar isOnline')
       .populate({
         path: 'lastMessage',
-        populate: { path: 'sender', select: 'name email avatar' },
+        select: 'content type sender createdAt',
       })
       .exec();
 

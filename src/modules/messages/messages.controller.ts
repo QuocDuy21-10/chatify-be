@@ -34,9 +34,7 @@ export class MessagesController {
       createMessageDto,
       senderId,
     );
-    return {
-      data: message,
-    };
+    return message;
   }
 
   @Post('mark-as-read')

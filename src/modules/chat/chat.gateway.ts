@@ -8,7 +8,8 @@ import {
   ConnectedSocket,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { UseGuards } from '@nestjs/common';
+import { UseGuards, Inject, forwardRef } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import { MessagesService } from '../messages/messages.service';
 import { ConversationsService } from '../conversations/conversations.service';
 import { UsersService } from '../users/users.service';
@@ -27,6 +28,7 @@ interface AuthenticatedSocket extends Socket {
     origin: '*',
     credentials: true,
   },
+  transports: ['websocket'],
 })
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
@@ -35,35 +37,52 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private connectedUsers: Map<string, string> = new Map(); // userId -> socketId
 
   constructor(
+    @Inject(forwardRef(() => MessagesService))
     private readonly messagesService: MessagesService,
     private readonly conversationsService: ConversationsService,
     private readonly usersService: UsersService,
+    private readonly jwtService: JwtService,
   ) {}
 
   async handleConnection(client: Socket) {
     try {
       const token = client.handshake.auth.token;
       if (!token) {
+        console.log('No token provided, disconnecting...');
         client.disconnect();
         return;
       }
 
-      // Verify token and get user (you'll need to implement this)
-      // For now, we'll assume the user is passed via handshake
-      const userId = client.handshake.auth.userId;
+      // Verify JWT token
+      const payload = this.jwtService.verify(token);
+      const userId = payload.sub;
 
-      if (userId) {
-        this.connectedUsers.set(userId, client.id);
-        await this.usersService.updateOnlineStatus(userId, true);
-
-        // Notify all users about this user's online status
-        this.server.emit('userStatusUpdate', {
-          userId,
-          isOnline: true,
-        });
-
-        console.log(`User ${userId} connected with socket ${client.id}`);
+      if (!userId) {
+        console.log('Invalid token payload, disconnecting...');
+        client.disconnect();
+        return;
       }
+
+      // Attach user info to socket
+      client['user'] = {
+        _id: userId,
+        email: payload.email,
+        name: payload.name,
+      };
+
+      // Store connection
+      this.connectedUsers.set(userId, client.id);
+
+      // Join user into their own room (for direct messaging)
+      client.join(`user:${userId}`);
+
+      // Update online status
+      await this.usersService.updateOnlineStatus(userId, true);
+
+      // Broadcast user online status
+      this.server.emit('user:online', { userId });
+
+      console.log(`User ${userId} connected with socket ${client.id}`);
     } catch (error) {
       console.error('Connection error:', error);
       client.disconnect();
@@ -78,11 +97,15 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       if (userId) {
         this.connectedUsers.delete(userId);
-        await this.usersService.updateOnlineStatus(userId, false);
-
-        this.server.emit('userStatusUpdate', {
+        const updatedUser = await this.usersService.updateOnlineStatus(
           userId,
-          isOnline: false,
+          false,
+        );
+
+        // Broadcast user offline status with lastSeen
+        this.server.emit('user:offline', {
+          userId,
+          lastSeen: updatedUser?.lastSeen || new Date(),
         });
 
         console.log(`User ${userId} disconnected`);
@@ -93,7 +116,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @UseGuards(WsJwtGuard)
-  @SubscribeMessage('joinConversation')
+  @SubscribeMessage('join-conversation')
   handleJoinConversation(
     @ConnectedSocket() client: AuthenticatedSocket,
     @MessageBody() data: { conversationId: string },
@@ -105,7 +128,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @UseGuards(WsJwtGuard)
-  @SubscribeMessage('leaveConversation')
+  @SubscribeMessage('leave-conversation')
   handleLeaveConversation(
     @ConnectedSocket() client: AuthenticatedSocket,
     @MessageBody() data: { conversationId: string },
@@ -163,30 +186,69 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @SubscribeMessage('typing')
   handleTyping(
     @ConnectedSocket() client: AuthenticatedSocket,
-    @MessageBody() data: { conversationId: string; receiverId: string },
+    @MessageBody() data: { conversationId: string; receiverId?: string },
   ) {
-    const receiverSocketId = this.connectedUsers.get(data.receiverId);
-    if (receiverSocketId) {
-      this.server.to(receiverSocketId).emit('typing', {
-        conversationId: data.conversationId,
-        userId: client.user._id,
-        userName: client.user.name,
-      });
+    // Emit to conversation room
+    this.server.to(`conversation:${data.conversationId}`).emit('user:typing', {
+      conversationId: data.conversationId,
+      userId: client.user._id,
+      userName: client.user.name,
+    });
+
+    // Also emit directly to receiver if specified
+    if (data.receiverId) {
+      const receiverSocketId = this.connectedUsers.get(data.receiverId);
+      if (receiverSocketId) {
+        this.server.to(receiverSocketId).emit('user:typing', {
+          conversationId: data.conversationId,
+          userId: client.user._id,
+          userName: client.user.name,
+        });
+      }
     }
   }
 
   @UseGuards(WsJwtGuard)
   @SubscribeMessage('stopTyping')
+  @SubscribeMessage('stopped-typing')
   handleStopTyping(
     @ConnectedSocket() client: AuthenticatedSocket,
-    @MessageBody() data: { conversationId: string; receiverId: string },
+    @MessageBody() data: { conversationId: string; receiverId?: string },
   ) {
-    const receiverSocketId = this.connectedUsers.get(data.receiverId);
-    if (receiverSocketId) {
-      this.server.to(receiverSocketId).emit('stopTyping', {
+    // Emit to conversation room
+    this.server
+      .to(`conversation:${data.conversationId}`)
+      .emit('user:stopped-typing', {
         conversationId: data.conversationId,
         userId: client.user._id,
       });
+
+    // Also emit directly to receiver if specified
+    if (data.receiverId) {
+      const receiverSocketId = this.connectedUsers.get(data.receiverId);
+      if (receiverSocketId) {
+        this.server.to(receiverSocketId).emit('user:stopped-typing', {
+          conversationId: data.conversationId,
+          userId: client.user._id,
+        });
+      }
     }
+  }
+
+  // Public method for MessagesService to emit new message
+  emitNewMessage(message: any) {
+    const receiverId = message.receiver || message.receiverId;
+
+    // Emit to conversation room
+    this.server
+      .to(`conversation:${message.conversationId}`)
+      .emit('message:received', message);
+
+    // Also emit directly to receiver's room if they're online
+    if (receiverId) {
+      this.server.to(`user:${receiverId}`).emit('message:received', message);
+    }
+
+    console.log(`Message emitted to conversation ${message.conversationId}`);
   }
 }

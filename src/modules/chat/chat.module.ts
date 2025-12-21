@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ChatGateway } from './chat.gateway';
@@ -24,10 +24,11 @@ import ms from 'ms';
       }),
       inject: [ConfigService],
     }),
-    MessagesModule,
-    ConversationsModule,
-    UsersModule,
+    forwardRef(() => MessagesModule),
+    forwardRef(() => ConversationsModule),
+    forwardRef(() => UsersModule),
   ],
   providers: [ChatGateway],
+  exports: [ChatGateway],
 })
 export class ChatModule {}

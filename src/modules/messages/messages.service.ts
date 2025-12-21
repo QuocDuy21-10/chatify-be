@@ -1,14 +1,21 @@
-import { Injectable } from '@nestjs/common';
+import { ConversationDocument } from './../conversations/schemas/conversation.schema';
+import { Injectable, Inject, forwardRef } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { Message, MessageDocument } from './schemas/message.schema';
 import { CreateMessageDto } from './dto/create-message.dto';
+import { ChatGateway } from '../chat/chat.gateway';
+import { Conversation } from '../conversations/schemas/conversation.schema';
 
 @Injectable()
 export class MessagesService {
   constructor(
     @InjectModel(Message.name)
     private messageModel: Model<MessageDocument>,
+    @Inject(forwardRef(() => ChatGateway))
+    private readonly chatGateway: ChatGateway,
+    @InjectModel(Conversation.name)
+    private conversationModel: Model<ConversationDocument>,
   ) {}
 
   async create(createMessageDto: CreateMessageDto, senderId: string) {
@@ -20,9 +27,25 @@ export class MessagesService {
       isRead: false,
     });
 
-    return await newMessage.populate([
+    await this.conversationModel.findByIdAndUpdate(
+      createMessageDto.conversationId,
+      {
+        lastMessage: newMessage._id,
+        updatedAt: new Date(),
+      },
+    );
+
+    const populatedMessage = await newMessage.populate([
       { path: 'sender', select: 'name email avatar isOnline' },
     ]);
+
+    // Emit real-time message to receiver
+    this.chatGateway.emitNewMessage({
+      ...populatedMessage.toObject(),
+      receiverId: createMessageDto.receiverId,
+    });
+
+    return populatedMessage;
   }
 
   async findByConversation(
